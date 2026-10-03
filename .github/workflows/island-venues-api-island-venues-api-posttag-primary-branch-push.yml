@@ -1,0 +1,257 @@
+name: Push to primary [island-venues-api]
+run-name: ""
+"on":
+  workflow_call:
+    inputs:
+      current_version:
+        required: true
+        type: string
+      target_version:
+        required: true
+        type: string
+jobs:
+  containerize-island-venues-api-build:
+    runs-on:
+      - ubuntu-latest
+    name: Containerize island-venues-api
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: download-artifacts
+        name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: dist/
+          pattern: island-venues-api-${{ inputs.target_version }}-${{ matrix.go-os }}-${{ matrix.go-arch }}
+      - id: generate-dockerfile
+        name: Generate Dockerfile
+        run: |2
+
+          mkdir -p ./dist
+
+          chmod +x ./dist/island-venues-api
+
+          cat <<-'EOT' > ./Dockerfile
+
+          FROM golang:alpine AS src
+          RUN apk --update add ca-certificates
+          RUN wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.28/grpc_health_probe-${{ matrix.go-os }}-${{ matrix.go-arch }} \
+          	&& chmod +x /bin/grpc_health_probe
+
+          FROM scratch
+
+          WORKDIR /
+          ARG RELEASE_VERSION=0.0.0
+          ARG RELEASE_TYPE=latest
+
+          ENV RELEASE_VERSION=${RELEASE_VERSION}
+          ENV RELEASE_TYPE=${RELEASE_TYPE}
+
+          COPY --from=src /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+          COPY --from=src /usr/local/go/lib/time/zoneinfo.zip /
+          COPY --from=src /bin/grpc_health_probe /bin/grpc_health_probe
+          ENV ZONEINFO=/zoneinfo.zip
+
+          COPY dist/* .
+
+          ENTRYPOINT ["/island-venues-api"]
+          EOT
+      - id: gcp-auth-access-token
+        name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}
+          service_account: ${{ secrets.GOOGLE_ACTIONS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.ISLAND_VENUES_WORKLOAD_IDENTITY_PROVIDER_ID }}
+      - id: gcloud-setup
+        name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta
+      - id: docker-setup
+        name: Setup Docker Actions
+        uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |-
+            {
+                          "debug": true,
+                          "features": {
+                            "containerd-snapshotter": true
+                          }
+                        }
+      - id: docker-login-docker-private
+        name: Authenticate to Docker docker-private Registry
+        uses: docker/login-action@v3
+        with:
+          password: ${{ steps.gcp-auth-access-token.outputs.access_token }}
+          registry: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+          username: oauth2accesstoken
+      - id: docker-prepare
+        name: Prepare Environment
+        run: |2
+          platform=${{ matrix.go-os }}/${{ matrix.go-arch }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+      - id: docker-meta
+        name: Resolve image metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-api
+      - id: setup-qemu
+        name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+      - id: setup-buildx
+        name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - id: docker-build
+        name: Build Docker
+        uses: docker/build-push-action@v6
+        with:
+          build-args: |-
+            RELEASE_TYPE=latest
+            RELEASE_VERSION=${{ inputs.target_version }}
+          context: .
+          file: ./Dockerfile
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          platforms: ${{ matrix.go-os }}/${{ matrix.go-arch }}
+          sbom: true
+          secrets: ""
+          tags: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-api
+      - id: docker-digest
+        name: Export Digest
+        run: |2
+          mkdir -p ${{ runner.temp }}/island-venues-api-digests
+          digest="${{ steps.docker-build.outputs.digest }}"
+          touch "${{ runner.temp }}/island-venues-api-digests/${digest#sha256:}"
+      - id: docker-upload-digest
+        name: Upload Digest
+        uses: actions/upload-artifact@v7
+        with:
+          if-no-files-found: error
+          name: island-venues-api-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/island-venues-api-digests/*
+          retention-days: 1
+    strategy:
+      matrix:
+        go-arch:
+          - amd64
+        go-os:
+          - linux
+        go-version:
+          - stable
+    permissions:
+      contents: read
+      id-token: write
+  containerize-island-venues-api-publish:
+    runs-on:
+      - ubuntu-latest
+    name: Publish Containers
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: gcp-auth-access-token
+        name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}
+          service_account: ${{ secrets.GOOGLE_ACTIONS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.ISLAND_VENUES_WORKLOAD_IDENTITY_PROVIDER_ID }}
+      - id: gcloud-setup
+        name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta
+      - id: docker-setup
+        name: Setup Docker Actions
+        uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |-
+            {
+                          "debug": true,
+                          "features": {
+                            "containerd-snapshotter": true
+                          }
+                        }
+      - id: docker-login-docker-private
+        name: Authenticate to Docker docker-private Registry
+        uses: docker/login-action@v3
+        with:
+          password: ${{ steps.gcp-auth-access-token.outputs.access_token }}
+          registry: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+          username: oauth2accesstoken
+      - id: download-digests
+        name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: ${{ runner.temp }}/island-venues-api-digests
+          pattern: island-venues-api-digests-*
+      - id: docker-meta
+        name: Resolve image metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-api
+          tags: |-
+            type=semver,pattern={{raw}},value=${{ inputs.target_version }}
+            type=sha
+            type=raw,value=latest
+      - id: setup-buildx
+        name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - id: docker-image-create
+        name: Create Docker Image
+        working-directory: ${{ runner.temp }}/island-venues-api-digests
+        run: |2
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          	$(for f in *; do printf '%s@sha256:%s ' "$REGISTRY_PUBLISH_URL_0/island-venues-api" "$f"; done)
+        env:
+          REGISTRY_PUBLISH_URL_0: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+      - id: docker-manifest-digest
+        name: Extract Manifest Digest
+        run: |2
+          IMAGE_TAG=$(jq -cr '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_TAG}" --format '{{.Manifest.Digest}}')
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "Manifest digest (from ${IMAGE_TAG}): ${DIGEST}"
+      - id: attest-binauthz-0
+        name: Create BinAuthz Attestation (docker-private)
+        run: |2
+          ATTESTOR_PROJECT=$(echo "${{ vars.ISLAND_VENUES_BINAUTHZ_KEY_VERSION }}" | cut -d/ -f2)
+          gcloud beta container binauthz attestations sign-and-create --quiet \
+            --project="${ATTESTOR_PROJECT}" \
+            --artifact-url="$ATTESTATION_SUBJECT@${{ steps.docker-manifest-digest.outputs.digest }}" \
+            --attestor="projects/${ATTESTOR_PROJECT}/attestors/infrastream-attestor" \
+            --keyversion="${{ vars.ISLAND_VENUES_BINAUTHZ_KEY_VERSION }}"
+        env:
+          ATTESTATION_SUBJECT: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-api
+      - id: notify-deployer
+        name: Notify Infrastream Deployer
+        working-directory: .
+        run: gcloud pubsub topics publish projects/${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}/topics/portal-domain-events --message="$DEPLOYMENT_NOTIFICATION_PAYLOAD" --attribute="source=ci,type=deployment.requested,event_id=${{ github.run_id }}-container"
+        env:
+          DEPLOYMENT_NOTIFICATION_PAYLOAD: '{"branchName":"${{ github.ref }}","buildDefinitionId":"-376705927153958102","version":"${{ inputs.target_version }}"}'
+    needs:
+      - containerize-island-venues-api-build
+    permissions:
+      contents: read
+      id-token: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-island-venues-api
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write

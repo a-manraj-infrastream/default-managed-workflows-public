@@ -1,0 +1,404 @@
+name: Push to primary [island-venues-web]
+run-name: ""
+"on":
+  workflow_call:
+    inputs:
+      current_version:
+        required: true
+        type: string
+      target_version:
+        required: true
+        type: string
+jobs:
+  containerize-island-venues-web-build:
+    runs-on:
+      - ubuntu-latest
+    name: Containerize island-venues-web
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: download-artifacts
+        name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: ./dist/web
+          pattern: island-venues-web-${{ inputs.target_version }}
+      - id: generate-dockerfile
+        name: Generate Dockerfile
+        run: |-
+          # Detect runtime: Next.js standalone (server.js) vs SPA (static files).
+          # With distDir: 'dist' in next.config, Next.js outputs directly to dist/
+          # which the artifact download places under dist/web/.
+          # public/ comes from the repo checkout (not the artifact).
+          if [ -f "./dist/web/standalone/server.js" ]; then
+            echo "Detected Next.js standalone output — generating Node.js Dockerfile"
+
+            cat <<'EOF' >"./Dockerfile"
+          FROM gcr.io/distroless/nodejs22-debian12
+          ARG RELEASE_VERSION=0.0.0
+          ARG RELEASE_TYPE=latest
+
+          WORKDIR /app
+
+          ENV NODE_ENV=production
+          ENV PORT=8080
+          ENV HOSTNAME="0.0.0.0"
+          ENV RELEASE_VERSION=${RELEASE_VERSION}
+          ENV RELEASE_TYPE=${RELEASE_TYPE}
+
+          COPY dist/web/standalone ./
+          COPY dist/web/static ./dist/static
+          COPY public ./public
+
+          EXPOSE 8080
+          CMD ["server.js"]
+          EOF
+
+          else
+            echo "Detected SPA output — generating Nginx Dockerfile"
+
+            mkdir -p "./dist/nginx"
+
+          cat <<'EOF' >"./dist/nginx/default.conf"
+          server {
+              listen       8080;
+              server_name  localhost;
+
+              include /etc/nginx/mime.types;
+              types {
+                  application/javascript  mjs;
+              }
+
+              add_header Cross-Origin-Opener-Policy  "same-origin"  always;
+              add_header Cross-Origin-Embedder-Policy "credentialless" always;
+
+              location = /health {
+                  access_log off;
+                  add_header 'Content-Type' 'application/json';
+                  return 200 '{"status":"UP"}';
+              }
+
+              location / {
+                  root      /usr/share/nginx/html;
+                  index     index.html;
+                  try_files $uri $uri/ /index.html;
+              }
+
+              error_page 500 502 503 504 /50x.html;
+              location = /50x.html {
+                  root /usr/share/nginx/html;
+              }
+          }
+          EOF
+
+          cat <<'EOF' >"./dist/startup.sh"
+          #!/bin/sh
+
+          echo "Replacing variables for /usr/share/nginx/html/index.html"
+          envsubst < "/usr/share/nginx/html/index.html" > "/tmp/index.html"
+          mv -f "/tmp/index.html" "/usr/share/nginx/html/index.html"
+
+          set -x
+          /docker-entrypoint.sh "$@"
+          EOF
+
+          cat <<'EOF' >"./dist/nginx/nginx.conf"
+          worker_processes  auto;
+              error_log  /dev/stdout warn;
+              pid        /tmp/nginx.pid;
+              events {
+          		worker_connections  1024;
+          	}
+          http {
+              include       /etc/nginx/mime.types;
+              default_type  application/octet-stream;
+              client_body_temp_path /tmp/client_temp;
+              proxy_temp_path       /tmp/proxy_temp_path;
+              fastcgi_temp_path     /tmp/fastcgi_temp;
+              uwsgi_temp_path       /tmp/uwsgi_temp;
+              scgi_temp_path        /tmp/scgi_temp;
+              log_format json_combined escape=json
+                  '{'
+                  '"@timestamp": "$time_iso8601",'
+                  '"time":"$msec",'
+                  '"requestMethod":"$request_method",'
+                  '"requestUrl":"$scheme://$host$request_uri",'
+                  '"requestSize":$request_length,'
+                  '"status":$status,'
+                  '"responseSize":$bytes_sent,'
+                  '"userAgent":"$http_user_agent",'
+                  '"remoteIp":"$http_x_forwarded_for",'
+                  '"serverIp":"$server_addr",'
+                  '"referer":"$http_referer",'
+                  '"latency":"${request_time}s",'
+                  '"protocol":"$server_protocol"'
+                  '}';
+              access_log  /dev/stdout  json_combined;
+              sendfile        on;
+              keepalive_timeout  65;
+              gzip  on;
+              include /etc/nginx/conf.d/*.conf;
+              include /etc/nginx/modules/*.conf;
+          }
+          EOF
+
+          cat <<'EOF' >"./Dockerfile"
+          FROM nginxinc/nginx-unprivileged:alpine
+          ARG RELEASE_VERSION=0.0.0
+          ARG RELEASE_TYPE=latest
+
+          ENV RELEASE_VERSION=${RELEASE_VERSION}
+          ENV RELEASE_TYPE=${RELEASE_TYPE}
+
+          USER nginx
+          COPY dist/web /usr/share/nginx/html
+          COPY dist/nginx/nginx.conf /etc/nginx/nginx.conf
+          COPY dist/nginx/default.conf /etc/nginx/conf.d/default.conf
+
+          USER root
+          COPY dist/startup.sh /startup.sh
+          RUN chgrp nginx /startup.sh && chmod +x /startup.sh
+          RUN chown -R nginx:nginx /usr/share/nginx/html
+          RUN ls -al /usr/share/nginx/html
+
+          USER nginx
+          ENTRYPOINT ["/startup.sh"]
+          EXPOSE 8080
+          STOPSIGNAL SIGQUIT
+          CMD ["nginx", "-g", "daemon off;"]
+          EOF
+
+          fi
+      - id: gcp-auth-access-token
+        name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}
+          service_account: ${{ secrets.GOOGLE_ACTIONS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.ISLAND_VENUES_WORKLOAD_IDENTITY_PROVIDER_ID }}
+      - id: gcloud-setup
+        name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta
+      - id: docker-setup
+        name: Setup Docker Actions
+        uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |-
+            {
+                          "debug": true,
+                          "features": {
+                            "containerd-snapshotter": true
+                          }
+                        }
+      - id: docker-login-docker-private
+        name: Authenticate to Docker docker-private Registry
+        uses: docker/login-action@v3
+        with:
+          password: ${{ steps.gcp-auth-access-token.outputs.access_token }}
+          registry: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+          username: oauth2accesstoken
+      - id: docker-prepare
+        name: Prepare Environment
+        run: |2
+          platform=linux/amd64
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+      - id: docker-meta
+        name: Resolve image metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-web
+      - id: setup-qemu
+        name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+      - id: setup-buildx
+        name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - id: docker-build
+        name: Build Docker
+        uses: docker/build-push-action@v6
+        with:
+          build-args: |-
+            RELEASE_TYPE=latest
+            RELEASE_VERSION=${{ inputs.target_version }}
+          context: .
+          file: ./Dockerfile
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          platforms: linux/amd64
+          sbom: true
+          secrets: ""
+          tags: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-web
+      - id: docker-digest
+        name: Export Digest
+        run: |2
+          mkdir -p ${{ runner.temp }}/island-venues-web-digests
+          digest="${{ steps.docker-build.outputs.digest }}"
+          touch "${{ runner.temp }}/island-venues-web-digests/${digest#sha256:}"
+      - id: docker-upload-digest
+        name: Upload Digest
+        uses: actions/upload-artifact@v7
+        with:
+          if-no-files-found: error
+          name: island-venues-web-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/island-venues-web-digests/*
+          retention-days: 1
+    permissions:
+      contents: read
+      id-token: write
+  containerize-island-venues-web-publish:
+    runs-on:
+      - ubuntu-latest
+    name: Publish Containers
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: gcp-auth-access-token
+        name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}
+          service_account: ${{ secrets.GOOGLE_ACTIONS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.ISLAND_VENUES_WORKLOAD_IDENTITY_PROVIDER_ID }}
+      - id: gcloud-setup
+        name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta
+      - id: docker-setup
+        name: Setup Docker Actions
+        uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |-
+            {
+                          "debug": true,
+                          "features": {
+                            "containerd-snapshotter": true
+                          }
+                        }
+      - id: docker-login-docker-private
+        name: Authenticate to Docker docker-private Registry
+        uses: docker/login-action@v3
+        with:
+          password: ${{ steps.gcp-auth-access-token.outputs.access_token }}
+          registry: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+          username: oauth2accesstoken
+      - id: download-digests
+        name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: ${{ runner.temp }}/island-venues-web-digests
+          pattern: island-venues-web-digests-*
+      - id: docker-meta
+        name: Resolve image metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-web
+          tags: |-
+            type=semver,pattern={{raw}},value=${{ inputs.target_version }}
+            type=sha
+            type=raw,value=latest
+      - id: setup-buildx
+        name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - id: docker-image-create
+        name: Create Docker Image
+        working-directory: ${{ runner.temp }}/island-venues-web-digests
+        run: |2
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          	$(for f in *; do printf '%s@sha256:%s ' "$REGISTRY_PUBLISH_URL_0/island-venues-web" "$f"; done)
+        env:
+          REGISTRY_PUBLISH_URL_0: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}
+      - id: docker-manifest-digest
+        name: Extract Manifest Digest
+        run: |2
+          IMAGE_TAG=$(jq -cr '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_TAG}" --format '{{.Manifest.Digest}}')
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "Manifest digest (from ${IMAGE_TAG}): ${DIGEST}"
+      - id: attest-binauthz-0
+        name: Create BinAuthz Attestation (docker-private)
+        run: |2
+          ATTESTOR_PROJECT=$(echo "${{ vars.ISLAND_VENUES_BINAUTHZ_KEY_VERSION }}" | cut -d/ -f2)
+          gcloud beta container binauthz attestations sign-and-create --quiet \
+            --project="${ATTESTOR_PROJECT}" \
+            --artifact-url="$ATTESTATION_SUBJECT@${{ steps.docker-manifest-digest.outputs.digest }}" \
+            --attestor="projects/${ATTESTOR_PROJECT}/attestors/infrastream-attestor" \
+            --keyversion="${{ vars.ISLAND_VENUES_BINAUTHZ_KEY_VERSION }}"
+        env:
+          ATTESTATION_SUBJECT: ${{ vars.ISLAND_VENUES_REGISTRY_DOCKER_PRIVATE_URL }}/island-venues-web
+      - id: notify-deployer
+        name: Notify Infrastream Deployer
+        working-directory: .
+        run: gcloud pubsub topics publish projects/${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}/topics/portal-domain-events --message="$DEPLOYMENT_NOTIFICATION_PAYLOAD" --attribute="source=ci,type=deployment.requested,event_id=${{ github.run_id }}-container"
+        env:
+          DEPLOYMENT_NOTIFICATION_PAYLOAD: '{"branchName":"${{ github.ref }}","buildDefinitionId":"-1326422015833586126","version":"${{ inputs.target_version }}"}'
+    needs:
+      - containerize-island-venues-web-build
+    permissions:
+      contents: read
+      id-token: write
+  publish:
+    runs-on:
+      - ubuntu-latest
+    name: Publish Static Bundle
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: gcp-auth-setup
+        name: Authenticate to Artifact Registry
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.ISLAND_VENUES_INFRASTREAM_CORE_PROJECT_ID }}
+          service_account: ${{ secrets.GOOGLE_ACTIONS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.ISLAND_VENUES_WORKLOAD_IDENTITY_PROVIDER_ID }}
+      - id: gcloud-setup
+        name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+      - id: download-bundle
+        name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: artifact/
+          pattern: island-venues-web-${{ inputs.target_version }}
+      - id: package-bundle
+        name: Package static bundle
+        run: tar -czf "island-venues-web-${{ inputs.target_version }}.tar.gz" -C artifact .
+      - id: publish-bundle
+        name: Publish static bundle
+        run: |-
+          set -euo pipefail
+          RES="${{ vars.ISLAND_VENUES_REGISTRY_STATIC_PRIVATE_URL }}"
+          PROJECT=$(printf '%s' "$RES" | cut -d/ -f2)
+          LOCATION=$(printf '%s' "$RES" | cut -d/ -f4)
+          REPO=$(printf '%s' "$RES" | cut -d/ -f6)
+          gcloud artifacts generic upload --project="$PROJECT" --location="$LOCATION" --repository="$REPO" --package=island-venues-web --version=${{ inputs.target_version }} --source=island-venues-web-${{ inputs.target_version }}.tar.gz
+    permissions:
+      contents: read
+      id-token: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-island-venues-web
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write

@@ -1,0 +1,193 @@
+name: Pull Request to releases [island-venues-web]
+run-name: ""
+"on":
+  workflow_call:
+    inputs:
+      current_version:
+        required: true
+        type: string
+      target_version:
+        required: true
+        type: string
+jobs:
+  analyze:
+    runs-on:
+      - ubuntu-latest
+    name: Static Analysis
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-node
+        name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          cache: npm
+          node-version: "22"
+      - id: install-dep
+        name: Install dependencies
+        run: npm ci
+      - id: eslint
+        name: ESLint
+        run: npx eslint . --ext .ts,.tsx --max-warnings=0 --report-unused-disable-directives
+      - id: tsc
+        name: TypeScript type check
+        run: npx tsc -b --noEmit
+      - id: i18n-audit
+        name: i18n audit
+        run: npm run i18n:audit --if-present
+    permissions:
+      contents: read
+      pull-requests: write
+  build:
+    runs-on:
+      - ubuntu-latest
+    name: Build
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-node
+        name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          cache: npm
+          node-version: "22"
+      - id: install-dep
+        name: Install dependencies
+        run: npm ci
+      - id: build
+        name: Build
+        run: npm run build
+      - id: upload-build
+        name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: island-venues-web-${{ inputs.target_version }}
+          path: dist/*
+  test:
+    runs-on:
+      - ubuntu-latest
+    name: Run Tests
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-node
+        name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          cache: npm
+          node-version: "22"
+      - id: install-dep
+        name: Install dependencies
+        run: npm ci
+      - id: detect-vitest
+        name: Detect Vitest
+        run: |-
+          if [ -d node_modules/vitest ]; then
+            echo "vitest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vitest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Vitest not installed (non-Vite app, e.g. Next.js) — skipping test steps."
+          fi
+      - id: detect-browser-tests
+        name: Detect browser test projects
+        run: |-
+          if npx vitest list --project browser > /dev/null 2>&1; then
+            echo "playwright=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "playwright=false" >> "$GITHUB_OUTPUT"
+          fi
+        if: ${{ steps.detect-vitest.outputs.vitest == 'true' }}
+      - id: install-playwright
+        name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        if: ${{ steps.detect-browser-tests.outputs.playwright == 'true' }}
+      - id: vitest
+        name: Run Tests
+        run: npx vitest run --reporter=verbose --reporter=json --outputFile=./vitest-results.json --passWithNoTests
+        if: ${{ steps.detect-vitest.outputs.vitest == 'true' }}
+      - id: transform-ctrf
+        name: Transform Vitest results to CTRF
+        run: |-
+          mkdir -p ./ctrf
+          jq '{
+            results: {
+              tool: { name: "vitest" },
+              summary: {
+                tests: ([.testResults[].assertionResults | length] | add // 0),
+                passed: ([.testResults[].assertionResults[] | select(.status == "passed")] | length),
+                failed: ([.testResults[].assertionResults[] | select(.status == "failed")] | length),
+                skipped: ([.testResults[].assertionResults[] | select(.status == "pending" or .status == "skipped")] | length),
+                pending: 0,
+                other: 0,
+                start: (.startTime // 0),
+                stop: ((.startTime // 0) + (.testResults | map(.endTime - .startTime) | add // 0))
+              },
+              tests: [
+                .testResults[].assertionResults[] |
+                {
+                  name: .fullName,
+                  status: (if .status == "passed" then "passed"
+                            elif .status == "failed" then "failed"
+                            else "skipped" end),
+                  duration: (.duration // 0)
+                }
+              ]
+            }
+          }' ./vitest-results.json > ./ctrf/ctrf-report.json 2>/dev/null || echo '{"results":{"tool":{"name":"vitest"},"summary":{"tests":0,"passed":0,"failed":0,"skipped":0,"pending":0,"other":0},"tests":[]}}' > ./ctrf/ctrf-report.json
+        if: ${{ always() && hashFiles('vitest-results.json') != '' }}
+      - id: publish-ctrf-results
+        name: Publish CTRF Test Results
+        uses: ctrf-io/github-test-reporter@v1
+        with:
+          failed-report: true
+          flaky-report: true
+          previous-results-report: true
+          pull-request: true
+          pull-request-report: true
+          report-path: ./ctrf/*.json
+          skipped-report: true
+          slowest-report: false
+          suite-folded-report: false
+          suite-list-report: false
+          summary-report: true
+          test-list-report: false
+          title: Test Report
+          update-comment: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: ${{ always() && hashFiles('ctrf/ctrf-report.json') != '' }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-island-venues-web
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write

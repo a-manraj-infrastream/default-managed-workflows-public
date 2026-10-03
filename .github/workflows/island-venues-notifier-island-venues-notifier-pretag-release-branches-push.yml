@@ -1,0 +1,244 @@
+name: Push to releases [island-venues-notifier]
+run-name: ""
+"on":
+  workflow_call:
+    inputs:
+      current_version:
+        required: true
+        type: string
+      target_version:
+        required: true
+        type: string
+jobs:
+  analyze:
+    runs-on:
+      - ubuntu-latest
+    name: Static Analysis
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-go
+        name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - id: install-dep
+        name: Install dependencies
+        run: go mod download
+      - id: go-generate
+        name: Run generate
+        run: |-
+          set -euo pipefail
+          go generate ./...
+          for mf in GNUmakefile makefile Makefile; do
+            [ -f "$mf" ] || continue
+            if grep -qE '^gen[[:space:]]*::?([^=]|$)' "$mf"; then
+              if awk '/^gen[[:space:]]*::?([^=]|$)/ { f = 1; next } /^[^[:space:]#]/ { f = 0 } f' "$mf" | grep -qE '(infrastream|pvotal)-tool-codegen-go'; then
+                echo "::warning title=Legacy generator not run::The gen target in $mf drives infrastream-tool-codegen-go, which needs an SSH agent CI does not have. Only go generate was checked; run make gen locally before committing."
+              else
+                make gen
+              fi
+            fi
+            break
+          done
+          # google-github-actions/auth writes gha-creds-*.json into the workspace before
+          # this step; they are per-run credentials, not generator output.
+          EXCL=':(exclude)gha-creds-*.json'
+          if [ -n "$(git status --porcelain -- . "$EXCL")" ]; then
+            echo "::error title=Generated files are out of date::Run the generators (make gen / go generate ./...) and commit the result. If the only changes are buf.lock plus protobuf output, an upstream proto module published a new commit and this branch needs to pick it up."
+            git status --porcelain -- . "$EXCL"
+            # Intent-to-add so files the generator CREATED appear in the stat below;
+            # git diff ignores untracked paths, and a new file is precisely what a new
+            # proto message produces. Safe: the step exits non-zero immediately after.
+            git add -N -- . "$EXCL"
+            git --no-pager diff --stat -- . "$EXCL"
+            exit 1
+          fi
+      - id: go-analysis-config
+        name: Configure Static Analysis
+        run: |2
+          cat <<-'EOF' > .golangci.yml
+          version: "2"
+          linters:
+            exclusions:
+              presets:
+                - comments
+                - common-false-positives
+                - legacy
+                - std-error-handling
+              paths:
+                - third_party$
+                - builtin$
+                - examples$
+                - \.pb\.go$
+              rules:
+                - linters: [errcheck]
+                  path: _test\.go$
+          formatters:
+            exclusions:
+              paths:
+                - third_party$
+                - builtin$
+                - examples$
+                - \.pb\.go$
+          EOF
+      - id: go-analysis
+        name: Static Analysis
+        uses: golangci/golangci-lint-action@v9
+        with:
+          args: --verbose --timeout=15m
+          version: latest
+    strategy:
+      matrix:
+        go-version:
+          - stable
+    permissions:
+      checks: write
+      contents: read
+  build:
+    runs-on:
+      - ubuntu-latest
+    name: Build
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-go
+        name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - id: install-dep
+        name: Install dependencies
+        run: go mod download
+      - id: go-generate
+        name: Run generate
+        run: |-
+          set -euo pipefail
+          go generate ./...
+          for mf in GNUmakefile makefile Makefile; do
+            [ -f "$mf" ] || continue
+            if grep -qE '^gen[[:space:]]*::?([^=]|$)' "$mf"; then
+              if awk '/^gen[[:space:]]*::?([^=]|$)/ { f = 1; next } /^[^[:space:]#]/ { f = 0 } f' "$mf" | grep -qE '(infrastream|pvotal)-tool-codegen-go'; then
+                echo "::warning title=Legacy generator not run::The gen target in $mf drives infrastream-tool-codegen-go, which needs an SSH agent CI does not have. Only go generate was checked; run make gen locally before committing."
+              else
+                make gen
+              fi
+            fi
+            break
+          done
+          # google-github-actions/auth writes gha-creds-*.json into the workspace before
+          # this step; they are per-run credentials, not generator output.
+          EXCL=':(exclude)gha-creds-*.json'
+          if [ -n "$(git status --porcelain -- . "$EXCL")" ]; then
+            echo "::error title=Generated files are out of date::Run the generators (make gen / go generate ./...) and commit the result. If the only changes are buf.lock plus protobuf output, an upstream proto module published a new commit and this branch needs to pick it up."
+            git status --porcelain -- . "$EXCL"
+            # Intent-to-add so files the generator CREATED appear in the stat below;
+            # git diff ignores untracked paths, and a new file is precisely what a new
+            # proto message produces. Safe: the step exits non-zero immediately after.
+            git add -N -- . "$EXCL"
+            git --no-pager diff --stat -- . "$EXCL"
+            exit 1
+          fi
+      - id: go-build
+        name: Build
+        run: CGO_ENABLED=0 GOOS=${{ matrix.go-os }} GOARCH=${{ matrix.go-arch }} go build -ldflags "-s -w" -v -o ./dist/island-venues-notifier main.go
+      - id: upload-build
+        name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: island-venues-notifier-${{ inputs.target_version }}-${{ matrix.go-os }}-${{ matrix.go-arch }}
+          path: dist/*
+    strategy:
+      matrix:
+        go-arch:
+          - amd64
+        go-os:
+          - linux
+        go-version:
+          - stable
+  test:
+    runs-on:
+      - ubuntu-latest
+    name: Run Tests
+    steps:
+      - id: harden-runner
+        uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: setup-go
+        name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - id: install-dep
+        name: Install dependencies
+        run: go mod download
+      - id: go-generate
+        name: Run generate
+        run: |-
+          set -euo pipefail
+          go generate ./...
+          for mf in GNUmakefile makefile Makefile; do
+            [ -f "$mf" ] || continue
+            if grep -qE '^gen[[:space:]]*::?([^=]|$)' "$mf"; then
+              if awk '/^gen[[:space:]]*::?([^=]|$)/ { f = 1; next } /^[^[:space:]#]/ { f = 0 } f' "$mf" | grep -qE '(infrastream|pvotal)-tool-codegen-go'; then
+                echo "::warning title=Legacy generator not run::The gen target in $mf drives infrastream-tool-codegen-go, which needs an SSH agent CI does not have. Only go generate was checked; run make gen locally before committing."
+              else
+                make gen
+              fi
+            fi
+            break
+          done
+          # google-github-actions/auth writes gha-creds-*.json into the workspace before
+          # this step; they are per-run credentials, not generator output.
+          EXCL=':(exclude)gha-creds-*.json'
+          if [ -n "$(git status --porcelain -- . "$EXCL")" ]; then
+            echo "::error title=Generated files are out of date::Run the generators (make gen / go generate ./...) and commit the result. If the only changes are buf.lock plus protobuf output, an upstream proto module published a new commit and this branch needs to pick it up."
+            git status --porcelain -- . "$EXCL"
+            # Intent-to-add so files the generator CREATED appear in the stat below;
+            # git diff ignores untracked paths, and a new file is precisely what a new
+            # proto message produces. Safe: the step exits non-zero immediately after.
+            git add -N -- . "$EXCL"
+            git --no-pager diff --stat -- . "$EXCL"
+            exit 1
+          fi
+      - id: go-test
+        name: Run Tests
+        run: set -o pipefail; go test -json ./... | tee test-out.json
+    strategy:
+      matrix:
+        go-version:
+          - stable
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-island-venues-notifier
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
